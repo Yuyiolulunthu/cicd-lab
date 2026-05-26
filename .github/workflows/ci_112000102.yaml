@@ -10,8 +10,8 @@ on:
 
 permissions:
   contents: read
-  checks: write          # dorny/test-reporter 需要這個權限才能發布 Check Run
-  pull-requests: write   # 在 PR 上留 inline 註解
+  checks: write # dorny/test-reporter 需要這個權限才能發布 Check Run
+  pull-requests: write # 在 PR 上留 inline 註解
 
 jobs:
   ci:
