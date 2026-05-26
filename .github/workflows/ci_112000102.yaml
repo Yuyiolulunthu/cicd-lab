@@ -1,0 +1,169 @@
+name: CI - 112000102
+
+# ─────────────────────────────────────────────────────────────
+# 觸發條件：所有 branch 的 push 事件 + 手動觸發 (workflow_dispatch)
+# 對應評分項目：pipeline 在 push 時自動執行
+# ─────────────────────────────────────────────────────────────
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write          # dorny/test-reporter 需要這個權限才能發布 Check Run
+  pull-requests: write   # 在 PR 上留 inline 註解
+
+jobs:
+  ci:
+    name: Lint • Typecheck • Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── 環境準備 ────────────────────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      # ── Quality Gate (三個檢查) ─────────────────
+      # 使用 `if: success() || failure()` 讓三個檢查互相獨立
+      # 任一失敗時，其他仍會執行，避免一次只看到一個錯誤
+      # 但 job 整體狀態仍會被任何失敗步驟標記為 failed
+      - name: 🎨 Prettier format check
+        id: prettier
+        run: npm run format:check
+
+      - name: 🔍 TypeScript typecheck
+        id: typecheck
+        if: success() || failure()
+        run: npm run typecheck
+
+      - name: 🧪 Run tests (Vitest)
+        id: test
+        if: success() || failure()
+        run: |
+          mkdir -p test-results
+          npx vitest run \
+            --reporter=default \
+            --reporter=junit \
+            --reporter=json \
+            --outputFile.junit=test-results/junit.xml \
+            --outputFile.json=test-results/results.json
+
+      # ── 測試報告呈現 (策略 1): dorny/test-reporter ─
+      # 將 JUnit XML 轉成 GitHub Checks 分頁的視覺化報告
+      # 點進 Action run 可直接看到每個 test case 的 pass/fail
+      - name: 📊 Publish test report (dorny/test-reporter)
+        id: test-report
+        if: always() && hashFiles('test-results/junit.xml') != ''
+        uses: dorny/test-reporter@v2
+        with:
+          name: Vitest Test Report
+          path: test-results/junit.xml
+          reporter: jest-junit
+          fail-on-error: true
+
+      # ── 測試報告呈現 (策略 2): GitHub Step Summary ─
+      # 自製 Markdown summary，直接顯示在 Action run 的 Summary 頁面
+      # 三大區塊：Pipeline 檢查總覽 / Vitest 統計 / 每個檔案的展開明細
+      - name: 📝 Write Job Summary
+        if: always()
+        env:
+          PRETTIER_OUTCOME: ${{ steps.prettier.outcome }}
+          TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          status_emoji() {
+            case "$1" in
+              success)   echo "✅ passed" ;;
+              failure)   echo "❌ failed" ;;
+              skipped)   echo "⏭️ skipped" ;;
+              cancelled) echo "🚫 cancelled" ;;
+              *)         echo "❓ $1" ;;
+            esac
+          }
+
+          {
+            echo "# 📦 CI Pipeline Report — 112000102"
+            echo ""
+            echo "**Commit:** \`${GITHUB_SHA:0:7}\` on \`${GITHUB_REF_NAME}\`"
+            echo "**Triggered by:** \`${GITHUB_EVENT_NAME}\` from @${GITHUB_ACTOR}"
+            echo ""
+            echo "## ✅ Pipeline Check Summary"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| 🎨 Prettier format check | $(status_emoji "$PRETTIER_OUTCOME") |"
+            echo "| 🔍 TypeScript typecheck  | $(status_emoji "$TYPECHECK_OUTCOME") |"
+            echo "| 🧪 Vitest tests          | $(status_emoji "$TEST_OUTCOME") |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f test-results/results.json ]; then
+            TOTAL=$(jq -r '.numTotalTests // 0' test-results/results.json)
+            PASSED=$(jq -r '.numPassedTests // 0' test-results/results.json)
+            FAILED=$(jq -r '.numFailedTests // 0' test-results/results.json)
+            SKIPPED=$(jq -r '.numPendingTests // 0' test-results/results.json)
+            SUITES=$(jq -r '.numTotalTestSuites // 0' test-results/results.json)
+            SUCCESS=$(jq -r '.success // false' test-results/results.json)
+            DURATION=$(jq -r '[.testResults[]? | (.endTime - .startTime)] | (add // 0) / 1000' test-results/results.json)
+
+            {
+              echo "## 🧪 Vitest Detail"
+              echo ""
+              if [ "$SUCCESS" = "true" ]; then
+                echo "**Overall:** ✅ All tests passed"
+              else
+                echo "**Overall:** ❌ Test failures detected"
+              fi
+              echo ""
+              echo "| Metric        | Value |"
+              echo "|---------------|-------|"
+              echo "| Test files    | $SUITES |"
+              echo "| Total tests   | $TOTAL |"
+              echo "| ✅ Passed     | $PASSED |"
+              echo "| ❌ Failed     | $FAILED |"
+              echo "| ⏭️ Skipped    | $SKIPPED |"
+              echo "| ⏱️ Duration   | ${DURATION}s |"
+              echo ""
+              echo "### 📁 Per-file Breakdown"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            jq -r '
+              .testResults[]? |
+              "<details><summary>" +
+              (if .status == "passed" then "✅ " else "❌ " end) +
+              (.name | split("/") | .[-1]) +
+              " — " + (.assertionResults | length | tostring) + " tests" +
+              "</summary>\n\n" +
+              (.assertionResults | map(
+                (if .status == "passed" then "- ✅ "
+                 elif .status == "failed" then "- ❌ "
+                 else "- ⏭️ " end) +
+                .fullName
+              ) | join("\n")) +
+              "\n\n</details>\n"
+            ' test-results/results.json >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_⚠️ No test result JSON was produced (vitest likely failed to start)._" \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── Artifact 留存 ─────────────────────────────
+      # 讓 reviewer 可以下載原始 JUnit XML / JSON 做進一步分析
+      - name: 📤 Upload test results
+        if: always() && hashFiles('test-results/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-112000102
+          path: test-results/
+          retention-days: 7
